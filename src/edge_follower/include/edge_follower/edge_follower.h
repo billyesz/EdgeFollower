@@ -4,6 +4,7 @@
 #include <sensor_msgs/LaserScan.h>
 #include <geometry_msgs/Twist.h>
 #include <geometry_msgs/PoseStamped.h>
+#include <nav_msgs/Path.h>
 #include <visualization_msgs/Marker.h>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.h>
@@ -22,6 +23,9 @@ public:
   EdgeFollower(ros::NodeHandle &nh);
   void laserCallback(const sensor_msgs::LaserScanConstPtr &scan);
   bool getRobotPose(geometry_msgs::PoseStamped &pose); // 需你实现或注入
+  std::vector<cv::Point2f> extractContourPoints(const sensor_msgs::LaserScan &scan);
+  nav_msgs::Path generateLocalTrajectory(const sensor_msgs::LaserScan &scan,
+                                         const std::string &global_frame = "odom");
 
 protected:
   struct EdgeSegment
@@ -37,13 +41,14 @@ private:
   double resolution_ = 0.05;
   int map_size_px_;
   double safe_distance_ = 0.3;
-  bool follow_left_ = true; // true: 沿左侧走（障碍在右）
+  bool follow_left_ = false; // true: 沿左侧走（障碍在右）
 
   // ROS
   ros::Subscriber laser_sub_;
   ros::Publisher cmd_vel_pub_;
   ros::Publisher marker_pub1_;
   ros::Publisher marker_pub2_;
+  ros::Publisher traj_pub_; // 用于可视化轨迹
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;
 

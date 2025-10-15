@@ -1,8 +1,0 @@
-prefix=/home/bill/catkin_ws/install
-
-Name: edge_follower
-Description: Description of edge_follower
-Version: 0.0.0
-Cflags: -I${prefix}/include
-Libs: -L${prefix}/lib 
-Requires: roscpp sensor_msgs geometry_msgs tf2_ros cv_bridge visualization_msgs
