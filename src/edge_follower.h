@@ -26,6 +26,8 @@ public:
   std::vector<cv::Point2f> extractContourPoints(const sensor_msgs::LaserScan &scan);
   nav_msgs::Path generateLocalTrajectory(const sensor_msgs::LaserScan &scan,
                                          const std::string &global_frame = "odom");
+  nav_msgs::Path generateCompareLocalTrajectory(const sensor_msgs::LaserScan &scan,
+                                                const std::string &global_frame);
 
 protected:
   struct EdgeSegment
@@ -45,8 +47,10 @@ private:
 
   // ROS
   ros::Subscriber laser_sub_;
+  ros::Publisher cmd_vel_pub_;
+  ros::Publisher marker_pub_;
   ros::Publisher traj_pub_; // 用于可视化轨迹
-  ros::Publisher fitted_contour_pub_;
+  ros::Publisher temp_traj_pub_;
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;
 
@@ -54,17 +58,22 @@ private:
   cv::Mat local_map_;
   mutable std::mutex map_mutex_;
 
+  // 核心逻辑
+  std::vector<cv::Point2f> getAllObstaclePoints();
+  std::vector<std::vector<cv::Point2f>> clusterPoints(
+      const std::vector<cv::Point2f> &points, double eps = 0.2);
+
+  EdgeSegment fitEdgeWithPCA(const std::vector<cv::Point2f> &pts);
+  bool findTarget(const std::vector<EdgeSegment> &segments, cv::Point2f &target);
+  void publishVelocity(const cv::Point2f &target);
+
+  void publishVisualization(
+      const std::vector<EdgeSegment> &segments,
+      const cv::Point2f &target_local,
+      const geometry_msgs::PoseStamped &robot_pose,
+      const ros::Time &stamp);
+
   std::vector<cv::Point2f> offsetPoints(
       const std::vector<cv::Point2f> &points,
       float robot_radius);
-  std::vector<cv::Point2f> fitSplineContour(const std::vector<cv::Point2f> &raw_points, int num_samples = 50);
-
-  std::vector<cv::Point2f> offsetSegment(
-      const std::vector<cv::Point2f> &segment,
-      float robot_radius);
-
-  void publishPointCloud(const std::vector<cv::Point2f> &points,
-                         const std::string &frame_id,
-                         const ros::Time &stamp,
-                         ros::Publisher &pub);
 };

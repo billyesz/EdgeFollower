@@ -15,6 +15,7 @@ find_package(catkin REQUIRED COMPONENTS
 
 # find_package(OpenCV REQUIRED)
 find_package(OpenCV 3 REQUIRED COMPONENTS core imgproc)
+find_package(Eigen3 REQUIRED)
 
 catkin_package(
   INCLUDE_DIRS include
@@ -25,6 +26,7 @@ include_directories(
   include
   ${catkin_INCLUDE_DIRS}
   ${OpenCV_INCLUDE_DIRS}
+  ${EIGEN3_INCLUDE_DIR}
 )
 
 add_executable(edge_follower_node
