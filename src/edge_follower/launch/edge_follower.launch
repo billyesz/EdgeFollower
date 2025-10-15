@@ -1,0 +1,7 @@
+<launch>
+  <!-- 启动你的 edge_follower 节点 -->
+  <node name="edge_follower_node" pkg="edge_follower" type="edge_follower_node" output="screen"/>
+
+  <!-- 启动 RViz 并加载你的配置文件 -->
+  <node name="rviz" pkg="rviz" type="rviz" args="-d $(find edge_follower)/config/my_robot.rviz" required="true"/>
+</launch>
