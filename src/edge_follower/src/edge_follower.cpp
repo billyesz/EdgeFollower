@@ -21,12 +21,14 @@ EdgeFollower::EdgeFollower(ros::NodeHandle &nh)
   marker_pub1_ = nh.advertise<visualization_msgs::Marker>("/edge_following_debug1", 1);
   marker_pub2_ = nh.advertise<visualization_msgs::MarkerArray>("/edge_following_debug2", 1);
   traj_pub_ = nh.advertise<nav_msgs::Path>("/edge_following_trajectory", 1);
+  temp_traj_pub_ = nh.advertise<nav_msgs::Path>("/edge_following_temp_trajectory", 1);
 }
 
 // ===== 激光回调 =====
 void EdgeFollower::laserCallback(const sensor_msgs::LaserScanConstPtr &scan)
 {
   auto local_traj = generateLocalTrajectory(*scan, "odom"); //  生成局部轨迹
+  generateCompareLocalTrajectory(*scan, "odom");            //  生成对比轨迹
   // return;  // TODO
 
   // === 1. 获取机器人在 odom 坐标系中的位姿 ===
@@ -536,11 +538,67 @@ bool EdgeFollower::getRobotPose(geometry_msgs::PoseStamped &pose)
   }
 }
 
+// std::vector<cv::Point2f> EdgeFollower::extractContourPoints(const sensor_msgs::LaserScan &scan)
+// {
+//   constexpr float MIN_DIST = 0.2f;
+//   constexpr float MAX_DIST = 1.2f;                    // 覆盖 1m 轨迹
+//   constexpr float ANGLE_HALF = 65.0f * M_PI / 180.0f; // 130° FOV
+
+//   std::vector<std::pair<float, cv::Point2f>> angle_point_pairs;
+
+//   for (size_t i = 0; i < scan.ranges.size(); ++i)
+//   {
+//     float range = scan.ranges[i];
+//     if (std::isnan(range) || std::isinf(range))
+//       continue;
+
+//     float angle = scan.angle_min + i * scan.angle_increment;
+//     if (std::abs(angle) > ANGLE_HALF)
+//       continue;
+//     if (range < MIN_DIST || range > MAX_DIST)
+//       continue;
+
+//     // 转为直角坐标（局部坐标系，x 向前，y 向左）
+//     float x = range * std::cos(angle);
+//     float y = range * std::sin(angle);
+
+//     // 根据 follow_left_ 选择哪一侧的点
+//     if (follow_left_)
+//     {
+//       // 小车在障碍左侧 → 需要障碍的**右侧轮廓** → y < 0 的点更相关
+//       // 但为了鲁棒性，我们保留所有点，后续排序时自然分离
+//       // 实际上，我们直接使用所有有效点，按角度排序即可
+//     }
+//     else
+//     {
+//       // 同理
+//     }
+
+//     angle_point_pairs.emplace_back(angle, cv::Point2f(x, y));
+//   }
+
+//   if (angle_point_pairs.empty())
+//     return {};
+
+//   // 按角度排序（从小到大：从右到左）
+//   std::sort(angle_point_pairs.begin(), angle_point_pairs.end(),
+//             [](const auto &a, const auto &b)
+//             { return a.first < b.first; });
+
+//   // 提取点列
+//   std::vector<cv::Point2f> points;
+//   points.reserve(angle_point_pairs.size());
+//   for (const auto &ap : angle_point_pairs)
+//     points.push_back(ap.second);
+
+//   return points;
+// }
+
 std::vector<cv::Point2f> EdgeFollower::extractContourPoints(const sensor_msgs::LaserScan &scan)
 {
   constexpr float MIN_DIST = 0.2f;
-  constexpr float MAX_DIST = 1.2f;                    // 覆盖 1m 轨迹
-  constexpr float ANGLE_HALF = 65.0f * M_PI / 180.0f; // 130° FOV
+  constexpr float MAX_DIST = 1.2f;
+  constexpr float ANGLE_HALF = 65.0f * M_PI / 180.0f;
 
   std::vector<std::pair<float, cv::Point2f>> angle_point_pairs;
 
@@ -556,22 +614,12 @@ std::vector<cv::Point2f> EdgeFollower::extractContourPoints(const sensor_msgs::L
     if (range < MIN_DIST || range > MAX_DIST)
       continue;
 
-    // 转为直角坐标（局部坐标系，x 向前，y 向左）
     float x = range * std::cos(angle);
     float y = range * std::sin(angle);
 
-    // 根据 follow_left_ 选择哪一侧的点
-    if (follow_left_)
-    {
-      // 小车在障碍左侧 → 需要障碍的**右侧轮廓** → y < 0 的点更相关
-      // 但为了鲁棒性，我们保留所有点，后续排序时自然分离
-      // 实际上，我们直接使用所有有效点，按角度排序即可
-    }
-    else
-    {
-      // 同理
-    }
-
+    // 注意：我们希望点列从左到右（y递增）或从右到左（y递减）
+    // 但为了统一，我们按 x 排序（从左到右）
+    // 或者更稳健地：按角度排序，然后反转如果需要
     angle_point_pairs.emplace_back(angle, cv::Point2f(x, y));
   }
 
@@ -583,11 +631,15 @@ std::vector<cv::Point2f> EdgeFollower::extractContourPoints(const sensor_msgs::L
             [](const auto &a, const auto &b)
             { return a.first < b.first; });
 
-  // 提取点列
+  // 提取点列（此时是右→左）
   std::vector<cv::Point2f> points;
   points.reserve(angle_point_pairs.size());
   for (const auto &ap : angle_point_pairs)
     points.push_back(ap.second);
+
+  // >>>>>>>> 新增：反转点列，使从左到右 <<<<<<<<
+  // 如果你想让点列从左到右（x递增），则反转
+  std::reverse(points.begin(), points.end());
 
   return points;
 }
@@ -659,35 +711,105 @@ std::vector<cv::Point2f> resamplePath(const std::vector<cv::Point2f> &path, floa
 }
 
 // 根据法向量偏移路径
-std::vector<cv::Point2f> offsetPoints(const std::vector<cv::Point2f>& points, float robot_radius)
+// std::vector<cv::Point2f> offsetPoints(const std::vector<cv::Point2f>& points, float robot_radius)
+// {
+//     std::vector<cv::Point2f> offset_path;
+//     if (points.size() < 2) return points; // 如果少于两个点，则直接返回
+
+//     for (size_t i = 0; i < points.size(); ++i)
+//     {
+//         cv::Point2f current_point = points[i];
+//         cv::Point2f prev_point = i > 0 ? points[i-1] : current_point;
+//         cv::Point2f next_point = i < points.size()-1 ? points[i+1] : current_point;
+
+//         // 计算当前点的切线向量（next - prev）
+//         cv::Point2f tangent = next_point - prev_point;
+
+//         // 法线向量（逆时针旋转90度）并归一化
+//         cv::Point2f normal(-tangent.y, tangent.x);
+//         float length = std::sqrt(normal.x * normal.x + normal.y * normal.y);
+//         if (length > 0) // 防止除零错误
+//         {
+//             normal.x /= length;
+//             normal.y /= length;
+//         }
+
+//         // 根据机器人半径偏移
+//         cv::Point2f offset_point = current_point + normal * robot_radius;
+//         offset_path.push_back(offset_point);
+//     }
+
+//     return offset_path;
+// }
+
+std::vector<cv::Point2f> EdgeFollower::offsetPoints(
+  const std::vector<cv::Point2f>& points,
+  float robot_radius)
 {
-    std::vector<cv::Point2f> offset_path;
-    if (points.size() < 2) return points; // 如果少于两个点，则直接返回
+  if (points.size() < 3) return points;
 
-    for (size_t i = 0; i < points.size(); ++i)
-    {
-        cv::Point2f current_point = points[i];
-        cv::Point2f prev_point = i > 0 ? points[i-1] : current_point;
-        cv::Point2f next_point = i < points.size()-1 ? points[i+1] : current_point;
+  // 计算平均点间距
+  float avg_distance = 0.0f;
+  for (size_t i = 1; i < points.size(); ++i) {
+      float d = cv::norm(points[i] - points[i-1]);
+      avg_distance += d;
+  }
+  avg_distance /= std::max(1.0f, static_cast<float>(points.size() - 1));
 
-        // 计算当前点的切线向量（next - prev）
-        cv::Point2f tangent = next_point - prev_point;
+  // 设置窗口大小：确保覆盖 ~1.5m 物理长度
+  int window_size = std::min(15, static_cast<int>(std::ceil(1.5 / avg_distance)));
+  int half_window = window_size / 2;
 
-        // 法线向量（逆时针旋转90度）并归一化
-        cv::Point2f normal(-tangent.y, tangent.x);
-        float length = std::sqrt(normal.x * normal.x + normal.y * normal.y);
-        if (length > 0) // 防止除零错误
-        {
-            normal.x /= length;
-            normal.y /= length;
-        }
+  std::vector<cv::Point2f> offset_path;
+  offset_path.reserve(points.size());
 
-        // 根据机器人半径偏移
-        cv::Point2f offset_point = current_point + normal * robot_radius;
-        offset_path.push_back(offset_point);
-    }
+  for (size_t i = 0; i < points.size(); ++i) {
+      cv::Point2f p = points[i];
 
-    return offset_path;
+      // 获取邻域点
+      std::vector<cv::Point2f> neighbors;
+      int start = std::max(0, static_cast<int>(i) - half_window);
+      int end = std::min(static_cast<int>(points.size()) - 1, static_cast<int>(i) + half_window);
+
+      for (int j = start; j <= end; ++j) {
+          neighbors.push_back(points[j]);
+      }
+
+      // PCA 拟合主方向
+      cv::Mat data(neighbors.size(), 2, CV_32F);
+      for (size_t k = 0; k < neighbors.size(); ++k) {
+          data.at<float>(k, 0) = neighbors[k].x;
+          data.at<float>(k, 1) = neighbors[k].y;
+      }
+
+      cv::PCA pca(data, cv::Mat(), CV_PCA_DATA_AS_ROW, 1);
+      cv::Mat eigenvec = pca.eigenvectors.row(0);
+      cv::Point2f tangent(eigenvec.at<float>(0), eigenvec.at<float>(1));
+      float t_norm = std::sqrt(tangent.x * tangent.x + tangent.y * tangent.y);
+      if (t_norm < 1e-4) {
+          offset_path.push_back(p);
+          continue;
+      }
+      tangent.x /= t_norm;
+      tangent.y /= t_norm;
+
+      // 法向方向
+      cv::Point2f normal_left(-tangent.y, tangent.x);
+      cv::Point2f normal_right(tangent.y, -tangent.x);
+
+      // 根据 follow_left_ 选择偏移方向
+      cv::Point2f offset_dir;
+      if (follow_left_) {
+          offset_dir = normal_left;
+      } else {
+          offset_dir = normal_right;
+      }
+
+      cv::Point2f offset_point = p + offset_dir * robot_radius;
+      offset_path.push_back(offset_point);
+  }
+
+  return offset_path;
 }
 
 nav_msgs::Path EdgeFollower::generateLocalTrajectory(const sensor_msgs::LaserScan &scan,
@@ -743,6 +865,60 @@ nav_msgs::Path EdgeFollower::generateLocalTrajectory(const sensor_msgs::LaserSca
 
   // 4. 发布可视化
   traj_pub_.publish(path);
+
+  return path;
+}
+
+nav_msgs::Path EdgeFollower::generateCompareLocalTrajectory(const sensor_msgs::LaserScan &scan,
+                                                            const std::string &global_frame)
+{
+  nav_msgs::Path path;
+  path.header.frame_id = global_frame;
+  path.header.stamp = ros::Time::now();
+
+  // 1. 提取原始轮廓点（局部坐标）
+  auto raw_points = extractContourPoints(scan);
+  if (raw_points.empty())
+  {
+    temp_traj_pub_.publish(path); // 发布空路径
+    return path;
+  }
+
+  // 2. 平滑 + 重采样
+  auto smoothed = smoothPath(raw_points, 3);
+  auto resampled = resamplePath(smoothed, 0.1f); // 0.1m 间隔
+
+  if (resampled.empty())
+  {
+    temp_traj_pub_.publish(path);
+    return path;
+  }
+
+  // 3. 转为 ROS Path（全局坐标）
+  geometry_msgs::PoseStamped robot_pose;
+  auto result = getRobotPose(robot_pose);
+  if (!result)
+  {
+    temp_traj_pub_.publish(path); // 发布空路径
+    return path;
+  }
+  tf2::Transform robot_tf;
+  tf2::fromMsg(robot_pose.pose, robot_tf);
+  for (const auto &p_local : resampled)
+  {
+    tf2::Vector3 v_local(p_local.x, p_local.y, 0);
+    tf2::Vector3 v_global = robot_tf * v_local;
+
+    geometry_msgs::PoseStamped pose;
+    pose.header = path.header;
+    pose.pose.position.x = v_global.x();
+    pose.pose.position.y = v_global.y();
+    pose.pose.orientation.w = 1.0; // 无朝向
+    path.poses.push_back(pose);
+  }
+
+  // 4. 发布可视化
+  temp_traj_pub_.publish(path);
 
   return path;
 }
