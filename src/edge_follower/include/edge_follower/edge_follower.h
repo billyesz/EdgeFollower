@@ -48,8 +48,7 @@ private:
   // ROS
   ros::Subscriber laser_sub_;
   ros::Publisher cmd_vel_pub_;
-  ros::Publisher marker_pub1_;
-  ros::Publisher marker_pub2_;
+  ros::Publisher marker_pub_;
   ros::Publisher traj_pub_; // 用于可视化轨迹
   ros::Publisher temp_traj_pub_;
   tf2_ros::Buffer tf_buffer_;
@@ -67,13 +66,8 @@ private:
   EdgeSegment fitEdgeWithPCA(const std::vector<cv::Point2f> &pts);
   bool findTarget(const std::vector<EdgeSegment> &segments, cv::Point2f &target);
   void publishVelocity(const cv::Point2f &target);
-  void publishVisualization(
-      const std::vector<EdgeSegment> &segments,
-      const cv::Point2f &target_local,
-      const geometry_msgs::PoseStamped &robot_pose,
-      const ros::Time &stamp); // 添加时间戳参数
 
-  void publishVisualization2(
+  void publishVisualization(
       const std::vector<EdgeSegment> &segments,
       const cv::Point2f &target_local,
       const geometry_msgs::PoseStamped &robot_pose,

@@ -1,5 +1,4 @@
 #include "edge_follower/edge_follower.h"
-// #include "edge_follower/edge_follower_utils.h"
 #include <cv_bridge/cv_bridge.h>
 #include <cmath> // for std::isfinite
 #include <sensor_msgs/Image.h>
@@ -18,8 +17,7 @@ EdgeFollower::EdgeFollower(ros::NodeHandle &nh)
 
   laser_sub_ = nh.subscribe("scan", 1, &EdgeFollower::laserCallback, this);
   cmd_vel_pub_ = nh.advertise<geometry_msgs::Twist>("cmd_vel", 1);
-  marker_pub1_ = nh.advertise<visualization_msgs::Marker>("/edge_following_debug1", 1);
-  marker_pub2_ = nh.advertise<visualization_msgs::MarkerArray>("/edge_following_debug2", 1);
+  marker_pub_ = nh.advertise<visualization_msgs::MarkerArray>("/edge_following_debug2", 1);
   traj_pub_ = nh.advertise<nav_msgs::Path>("/edge_following_trajectory", 1);
   temp_traj_pub_ = nh.advertise<nav_msgs::Path>("/edge_following_temp_trajectory", 1);
 }
@@ -27,7 +25,7 @@ EdgeFollower::EdgeFollower(ros::NodeHandle &nh)
 // ===== 激光回调 =====
 void EdgeFollower::laserCallback(const sensor_msgs::LaserScanConstPtr &scan)
 {
-  auto local_traj = generateLocalTrajectory(*scan, "odom"); //  生成局部轨迹
+  auto local_traj = generateLocalTrajectory(*scan, "odom");
   generateCompareLocalTrajectory(*scan, "odom");            //  生成对比轨迹
   // return;  // TODO
 
@@ -69,17 +67,6 @@ void EdgeFollower::laserCallback(const sensor_msgs::LaserScanConstPtr &scan)
     double lx = range * std::cos(angle);
     double ly = range * std::sin(angle);
 
-    // // 转换到局部地图坐标（相对于机器人中心）
-    // double dx = cos_yaw * lx - sin_yaw * ly; // 实际上这里不需要，因为局部地图本身就是机器人坐标系
-    // double dy = sin_yaw * lx + cos_yaw * ly;
-
-    // 但注意：局部地图是以机器人当前位置为中心的，所以直接用 (lx, ly) 即可！
-    // 因为 scan->header.frame_id 通常是 base_scan，而 base_scan ≈ base_footprint（xy≈0）
-    // 所以我们可以简化：直接用 (lx, ly) 作为局部坐标
-    // 但为了鲁棒性，保留原有方式（不影响结果）
-
-    // int px = static_cast<int>(dx / resolution_ + center);
-    // int py = static_cast<int>(dy / resolution_ + center);
     // 直接使用 (lx, ly) 作为局部坐标（相对于 base_footprint）
     int px = static_cast<int>(lx / resolution_ + center);
     int py = static_cast<int>(ly / resolution_ + center);
@@ -123,8 +110,7 @@ void EdgeFollower::laserCallback(const sensor_msgs::LaserScanConstPtr &scan)
     robot_pose.pose.position.y = robot_y;
     robot_pose.pose.orientation = robot_tf.transform.rotation;
 
-    // publishVisualization(segments, target_local, robot_pose, scan->header.stamp);
-    publishVisualization2(segments, target_local, robot_pose, scan->header.stamp);
+    publishVisualization(segments, target_local, robot_pose, scan->header.stamp);
   }
   else
   {
@@ -300,7 +286,7 @@ void EdgeFollower::publishVelocity(const cv::Point2f &target)
   cmd_vel_pub_.publish(cmd);
 }
 
-void EdgeFollower::publishVisualization2(
+void EdgeFollower::publishVisualization(
     const std::vector<EdgeSegment> &segments,
     const cv::Point2f &target_local,
     const geometry_msgs::PoseStamped &robot_pose,
@@ -449,72 +435,7 @@ void EdgeFollower::publishVisualization2(
 
   // === 5. 发布 MarkerArray ===
   // 注意：即使 markers 为空，也可以安全发布
-  marker_pub2_.publish(marker_array);
-}
-
-// // ===== 可视化调试（关键修复）=====
-void EdgeFollower::publishVisualization(
-    const std::vector<EdgeSegment> &segments,
-    const cv::Point2f &target_local,
-    const geometry_msgs::PoseStamped &robot_pose,
-    const ros::Time &stamp)
-{
-  // 发布边缘线段
-  visualization_msgs::Marker line_marker;
-  line_marker.header.frame_id = "odom";
-  line_marker.header.stamp = stamp; // ← 使用激光时间戳
-  line_marker.ns = "edges";
-  line_marker.id = 0;
-  line_marker.type = visualization_msgs::Marker::LINE_LIST;
-  line_marker.action = visualization_msgs::Marker::ADD;
-  line_marker.scale.x = 0.02;
-  line_marker.color.r = 1.0;
-  line_marker.color.g = 0.0;
-  line_marker.color.b = 0.0;
-  line_marker.color.a = 1.0;
-
-  double rx = robot_pose.pose.position.x;
-  double ry = robot_pose.pose.position.y;
-
-  for (const auto &seg : segments)
-  {
-    cv::Point2f p1 = seg.centroid + 0.5f * seg.direction;
-    cv::Point2f p2 = seg.centroid - 0.5f * seg.direction;
-
-    // 转换到 odom 坐标系
-    geometry_msgs::Point gp1, gp2;
-    gp1.x = rx + p1.x;
-    gp1.y = ry + p1.y;
-    gp1.z = 0.0;
-    gp2.x = rx + p2.x;
-    gp2.y = ry + p2.y;
-    gp2.z = 0.0;
-
-    line_marker.points.push_back(gp1);
-    line_marker.points.push_back(gp2);
-  }
-
-  if (!line_marker.points.empty())
-  {
-    marker_pub1_.publish(line_marker);
-  }
-
-  // 发布目标点（在 odom 中）
-  visualization_msgs::Marker target_marker;
-  target_marker.header.frame_id = "odom";
-  target_marker.header.stamp = stamp;
-  target_marker.ns = "target";
-  target_marker.id = 0;
-  target_marker.type = visualization_msgs::Marker::SPHERE;
-  target_marker.action = visualization_msgs::Marker::ADD;
-  target_marker.pose.position.x = rx + target_local.x;
-  target_marker.pose.position.y = ry + target_local.y;
-  target_marker.pose.position.z = 0.1;
-  target_marker.scale.x = target_marker.scale.y = target_marker.scale.z = 0.1;
-  target_marker.color.g = 1.0;
-  target_marker.color.a = 1.0;
-
-  marker_pub1_.publish(target_marker);
+  marker_pub_.publish(marker_array);
 }
 
 // ===== getRobotPose 可保留（但未使用）=====
@@ -537,62 +458,6 @@ bool EdgeFollower::getRobotPose(geometry_msgs::PoseStamped &pose)
     return false;
   }
 }
-
-// std::vector<cv::Point2f> EdgeFollower::extractContourPoints(const sensor_msgs::LaserScan &scan)
-// {
-//   constexpr float MIN_DIST = 0.2f;
-//   constexpr float MAX_DIST = 1.2f;                    // 覆盖 1m 轨迹
-//   constexpr float ANGLE_HALF = 65.0f * M_PI / 180.0f; // 130° FOV
-
-//   std::vector<std::pair<float, cv::Point2f>> angle_point_pairs;
-
-//   for (size_t i = 0; i < scan.ranges.size(); ++i)
-//   {
-//     float range = scan.ranges[i];
-//     if (std::isnan(range) || std::isinf(range))
-//       continue;
-
-//     float angle = scan.angle_min + i * scan.angle_increment;
-//     if (std::abs(angle) > ANGLE_HALF)
-//       continue;
-//     if (range < MIN_DIST || range > MAX_DIST)
-//       continue;
-
-//     // 转为直角坐标（局部坐标系，x 向前，y 向左）
-//     float x = range * std::cos(angle);
-//     float y = range * std::sin(angle);
-
-//     // 根据 follow_left_ 选择哪一侧的点
-//     if (follow_left_)
-//     {
-//       // 小车在障碍左侧 → 需要障碍的**右侧轮廓** → y < 0 的点更相关
-//       // 但为了鲁棒性，我们保留所有点，后续排序时自然分离
-//       // 实际上，我们直接使用所有有效点，按角度排序即可
-//     }
-//     else
-//     {
-//       // 同理
-//     }
-
-//     angle_point_pairs.emplace_back(angle, cv::Point2f(x, y));
-//   }
-
-//   if (angle_point_pairs.empty())
-//     return {};
-
-//   // 按角度排序（从小到大：从右到左）
-//   std::sort(angle_point_pairs.begin(), angle_point_pairs.end(),
-//             [](const auto &a, const auto &b)
-//             { return a.first < b.first; });
-
-//   // 提取点列
-//   std::vector<cv::Point2f> points;
-//   points.reserve(angle_point_pairs.size());
-//   for (const auto &ap : angle_point_pairs)
-//     points.push_back(ap.second);
-
-//   return points;
-// }
 
 std::vector<cv::Point2f> EdgeFollower::extractContourPoints(const sensor_msgs::LaserScan &scan)
 {
@@ -709,38 +574,6 @@ std::vector<cv::Point2f> resamplePath(const std::vector<cv::Point2f> &path, floa
 
   return resampled;
 }
-
-// 根据法向量偏移路径
-// std::vector<cv::Point2f> offsetPoints(const std::vector<cv::Point2f>& points, float robot_radius)
-// {
-//     std::vector<cv::Point2f> offset_path;
-//     if (points.size() < 2) return points; // 如果少于两个点，则直接返回
-
-//     for (size_t i = 0; i < points.size(); ++i)
-//     {
-//         cv::Point2f current_point = points[i];
-//         cv::Point2f prev_point = i > 0 ? points[i-1] : current_point;
-//         cv::Point2f next_point = i < points.size()-1 ? points[i+1] : current_point;
-
-//         // 计算当前点的切线向量（next - prev）
-//         cv::Point2f tangent = next_point - prev_point;
-
-//         // 法线向量（逆时针旋转90度）并归一化
-//         cv::Point2f normal(-tangent.y, tangent.x);
-//         float length = std::sqrt(normal.x * normal.x + normal.y * normal.y);
-//         if (length > 0) // 防止除零错误
-//         {
-//             normal.x /= length;
-//             normal.y /= length;
-//         }
-
-//         // 根据机器人半径偏移
-//         cv::Point2f offset_point = current_point + normal * robot_radius;
-//         offset_path.push_back(offset_point);
-//     }
-
-//     return offset_path;
-// }
 
 std::vector<cv::Point2f> EdgeFollower::offsetPoints(
   const std::vector<cv::Point2f>& points,
