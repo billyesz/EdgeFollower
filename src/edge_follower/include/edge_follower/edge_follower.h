@@ -41,7 +41,10 @@ private:
   double resolution_ = 0.05;
   int map_size_px_;
   double safe_distance_ = 0.3;
-  bool follow_left_ = false; // true: 沿左侧走（障碍在右）
+  // follow_left_ 定义：
+  // true: 障碍物（墙）在机器人左侧，机器人沿其右侧边缘行驶,
+  // false:	障碍物（墙）在机器人右侧，机器人沿其左侧边缘行驶
+  bool follow_left_ = true;
 
   // ROS
   ros::Subscriber laser_sub_;

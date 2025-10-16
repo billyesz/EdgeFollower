@@ -96,6 +96,52 @@ std::vector<cv::Point2f> limitCurvature(const std::vector<cv::Point2f> &path, fl
   return smoothed;
 }
 
+std::vector<cv::Point2f> filterSidePoints(
+    const std::vector<cv::Point2f> &points,
+    bool follow_left)
+{
+  if (points.empty())
+    return {};
+
+  std::vector<std::vector<cv::Point2f>> segments;
+  std::vector<cv::Point2f> current_seg;
+
+  for (const auto &p : points)
+  {
+    bool is_target_side = follow_left ? (p.y > 0) : (p.y < 0);
+    if (is_target_side)
+    {
+      current_seg.push_back(p);
+    }
+    else
+    {
+      if (!current_seg.empty())
+      {
+        segments.push_back(current_seg);
+        current_seg.clear();
+      }
+    }
+  }
+  if (!current_seg.empty())
+  {
+    segments.push_back(current_seg);
+  }
+
+  // 选择最长段
+  size_t max_len = 0;
+  size_t best_idx = 0;
+  for (size_t i = 0; i < segments.size(); ++i)
+  {
+    if (segments[i].size() > max_len)
+    {
+      max_len = segments[i].size();
+      best_idx = i;
+    }
+  }
+  ROS_WARN("max_len : %zu, best_idx: %zu, segments.size(): %zu", max_len, best_idx, segments.size());
+  return (max_len >= 2) ? segments[best_idx] : std::vector<cv::Point2f>();
+}
+
 EdgeFollower::EdgeFollower(ros::NodeHandle &nh)
     : tf_listener_(tf_buffer_),
       map_size_px_(static_cast<int>(map_size_m_ / resolution_))
@@ -134,7 +180,7 @@ bool EdgeFollower::getRobotPose(geometry_msgs::PoseStamped &pose)
   }
 }
 
-// ===== 提取轮廓点（修复排序）=====
+// ===== 提取轮廓点 （局部坐标）=====
 std::vector<cv::Point2f> EdgeFollower::extractContourPoints(const sensor_msgs::LaserScan &scan)
 {
   constexpr float MIN_DIST = 0.2f;
@@ -142,25 +188,28 @@ std::vector<cv::Point2f> EdgeFollower::extractContourPoints(const sensor_msgs::L
   constexpr float ANGLE_HALF = 65.0f * M_PI / 180.0f;
   std::vector<std::pair<float, cv::Point2f>> angle_point_pairs;
 
+  // ROS_INFO("scan.ranges.size : %zu", scan.ranges.size());
   for (size_t i = 0; i < scan.ranges.size(); ++i)
   {
     float range = scan.ranges[i];
     if (std::isnan(range) || std::isinf(range))
       continue;
     float angle = scan.angle_min + i * scan.angle_increment;
-    if (std::abs(angle) > ANGLE_HALF)
+    float angle_deg = angle * 180.0f / M_PI;
+    if (std::abs(angle) > ANGLE_HALF) // FOV: -65° ~ +65°
       continue;
     if (range < MIN_DIST || range > MAX_DIST)
       continue;
     float x = range * std::cos(angle);
     float y = range * std::sin(angle);
+    // ROS_INFO("[%zu] (%f, %f) @ angle %f  angle_deg %f  scan.angle_min %f  scan.angle_increment %f", i, x, y, angle, angle_deg, scan.angle_min, scan.angle_increment);
     angle_point_pairs.emplace_back(angle, cv::Point2f(x, y));
   }
 
   if (angle_point_pairs.empty())
     return {};
 
-  // 按角度排序（从小到大：右→左）
+  // 按角度排序，即从-65°到65°依次排序（右→左）
   std::sort(angle_point_pairs.begin(), angle_point_pairs.end(),
             [](const auto &a, const auto &b)
             { return a.first < b.first; });
@@ -168,17 +217,23 @@ std::vector<cv::Point2f> EdgeFollower::extractContourPoints(const sensor_msgs::L
   std::vector<cv::Point2f> points;
   points.reserve(angle_point_pairs.size());
   for (const auto &ap : angle_point_pairs)
+  {
     points.push_back(ap.second);
+  }
 
-  // 反转：使点列从左→右（x 递增）
-  std::reverse(points.begin(), points.end());
+  // points 永远是从右→左（y 递增），针对不同的场景，后续对点的顺序需要调整，否则路径方向会出错
+  // 比如：follow_left_ = true 时，激光点从右→左，路径方向就会反了
+  // follow_left_ = false 时，激光点从右→左，路径方向就是对的
+
+  // std::reverse(points.begin(), points.end());
   return points;
 }
 
-// ===== 新增：使用 Eigen Spline 拟合光滑轮廓 =====
+// ===== 使用 Eigen Spline 拟合光滑轮廓 =====
+// 作用：将原始离散的墙轮廓点 raw_points 拟合成一条平滑的三次样条曲线，并在曲线上均匀重采样 num_samples + 1 个点，用于后续轨迹生成。
 std::vector<cv::Point2f> EdgeFollower::fitSplineContour(const std::vector<cv::Point2f> &raw_points, int num_samples)
 {
-  // ✅ 关键修复：三次样条至少需要 4 个点
+  // 关键修复：三次样条至少需要 4 个点
   if (raw_points.size() < 4)
   {
     // 点太少：直接返回原始点（或线性插值）
@@ -236,7 +291,7 @@ std::vector<cv::Point2f> EdgeFollower::fitSplineContour(const std::vector<cv::Po
     data(1, i) = raw_points[i].y;
   }
 
-  // ✅ 现在安全：raw_points.size() >= 4
+  // 现在安全：raw_points.size() >= 4
   Spline2d spline = Eigen::SplineFitting<Spline2d>::Interpolate(data, 3, Eigen::Map<Eigen::VectorXf>(u.data(), u.size()));
 
   std::vector<cv::Point2f> fitted;
@@ -258,6 +313,8 @@ std::vector<cv::Point2f> EdgeFollower::offsetPoints(
   if (points.size() < 3)
     return points;
 
+  // 计算平均点间距，估计点云的空间密度
+  // 这是自适应窗口的关键：点密 → 窗口小；点疏 → 窗口大
   float avg_distance = 0.0f;
   for (size_t i = 1; i < points.size(); ++i)
   {
@@ -266,8 +323,13 @@ std::vector<cv::Point2f> EdgeFollower::offsetPoints(
   }
   avg_distance /= std::max(1.0f, static_cast<float>(points.size() - 1));
 
+  // 动态计算 PCA 窗口大小：确保覆盖 ~1.5m 物理长度
+  // 1.5m是一个经验长度，表示 PCA 应该在 1.5 米范围内拟合局部切线
+  // ≤15是防止在极稀疏点云中窗口过大（如 avg_distance=0.01 → window=150，计算慢且过平滑）
+  // half_window 用于以当前点为中心取邻域
   int window_size = std::min(15, static_cast<int>(std::ceil(1.5f / avg_distance)));
   int half_window = window_size / 2;
+
   std::vector<cv::Point2f> offset_path;
   offset_path.reserve(points.size());
 
@@ -303,7 +365,8 @@ std::vector<cv::Point2f> EdgeFollower::offsetPoints(
     cv::Point2f normal_left(-tangent.y, tangent.x);
     cv::Point2f normal_right(tangent.y, -tangent.x);
 
-    cv::Point2f offset_dir = follow_left_ ? normal_left : normal_right;
+    cv::Point2f offset_dir = follow_left_ ? normal_right : normal_left;
+    // cv::Point2f offset_dir = follow_left_ ? normal_left : normal_right;
     cv::Point2f offset_point = p + offset_dir * robot_radius;
     offset_path.push_back(offset_point);
   }
@@ -338,6 +401,9 @@ nav_msgs::Path EdgeFollower::generateLocalTrajectory(const sensor_msgs::LaserSca
   path.header.stamp = ros::Time::now();
 
   auto raw_points = extractContourPoints(scan);
+
+  auto filter_points = filterSidePoints(raw_points, follow_left_);
+
   if (raw_points.size() < 2)
   { // 至少两个点才有意义
     traj_pub_.publish(path);
@@ -345,7 +411,7 @@ nav_msgs::Path EdgeFollower::generateLocalTrajectory(const sensor_msgs::LaserSca
   }
 
   // ===== 关键修改：使用 Spline 拟合代替 smoothPath + resamplePath =====
-  auto fitted_contour = fitSplineContour(raw_points, 40); // 40 个采样点
+  auto fitted_contour = fitSplineContour(filter_points, 40); // 40 个采样点
   publishPointCloud(fitted_contour, "base_footprint", ros::Time::now(), fitted_contour_pub_);
 
   float robot_radius = 0.25f; // 根据你的参数
@@ -396,7 +462,7 @@ void EdgeFollower::publishPointCloud(const std::vector<cv::Point2f> &points,
                                      ros::Publisher &pub)
 {
   if (points.empty())
-    return; // ✅ 新增：空则不发布
+    return; // 新增：空则不发布
 
   sensor_msgs::PointCloud cloud;
   cloud.header.frame_id = frame_id;
