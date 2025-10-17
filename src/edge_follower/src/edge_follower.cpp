@@ -138,7 +138,6 @@ std::vector<cv::Point2f> filterSidePoints(
       best_idx = i;
     }
   }
-  ROS_WARN("max_len : %zu, best_idx: %zu, segments.size(): %zu", max_len, best_idx, segments.size());
   return (max_len >= 2) ? segments[best_idx] : std::vector<cv::Point2f>();
 }
 
@@ -305,15 +304,16 @@ std::vector<cv::Point2f> EdgeFollower::fitSplineContour(const std::vector<cv::Po
   return fitted;
 }
 
-// ===== 偏移轮廓（保持不变）=====
+// ===== 偏移轮廓 =====
 std::vector<cv::Point2f> EdgeFollower::offsetPoints(
     const std::vector<cv::Point2f> &points,
-    float robot_radius)
+    float offset_value)
 {
+  // PCA 需要至少 2 个点才能计算方向，但 2 个点时窗口可能退化。保守起见，少于 3 点直接返回
   if (points.size() < 3)
     return points;
 
-  // 计算平均点间距，估计点云的空间密度
+  // 计算平均的点间距，估计点云的空间密度
   // 这是自适应窗口的关键：点密 → 窗口小；点疏 → 窗口大
   float avg_distance = 0.0f;
   for (size_t i = 1; i < points.size(); ++i)
@@ -336,6 +336,9 @@ std::vector<cv::Point2f> EdgeFollower::offsetPoints(
   for (size_t i = 0; i < points.size(); ++i)
   {
     cv::Point2f p = points[i];
+    // 构建局部邻域（滑动窗口）
+    // 注意：这是按索引取邻域，不是按距离！
+    // 潜在问题：如果原始点序不连续（如跳变），邻域可能包含无关点
     std::vector<cv::Point2f> neighbors;
     int start = std::max(0, static_cast<int>(i) - half_window);
     int end = std::min(static_cast<int>(points.size()) - 1, static_cast<int>(i) + half_window);
@@ -344,30 +347,40 @@ std::vector<cv::Point2f> EdgeFollower::offsetPoints(
       neighbors.push_back(points[j]);
     }
 
+    // 对局部邻域点集执行 PCA 获取局部切线方向
     cv::Mat data(neighbors.size(), 2, CV_32F);
     for (size_t k = 0; k < neighbors.size(); ++k)
     {
       data.at<float>(k, 0) = neighbors[k].x;
       data.at<float>(k, 1) = neighbors[k].y;
     }
+    // PCA 原理：找数据方差最大的方向 → 局部切线方向
+    // CV_PCA_DATA_AS_ROW：每行是一个点
+    // 1：只保留第一主成分（切线），忽略法向（噪声）
     cv::PCA pca(data, cv::Mat(), CV_PCA_DATA_AS_ROW, 1);
     cv::Mat eigenvec = pca.eigenvectors.row(0);
     cv::Point2f tangent(eigenvec.at<float>(0), eigenvec.at<float>(1));
+    // 切线归一化（得到只表示方向的单位向量tangent）
     float t_norm = std::sqrt(tangent.x * tangent.x + tangent.y * tangent.y);
     if (t_norm < 1e-4)
     {
+      // 如果所有邻居点都重合（比如激光打到一个点反复返回），PCA 会返回一个零向量 (0, 0)。
+      // 长度是 0 → 无法归一化（除以 0 会崩溃）
+      // 所以直接跳过偏移，保留原点
       offset_path.push_back(p);
       continue;
     }
     tangent.x /= t_norm;
     tangent.y /= t_norm;
 
-    cv::Point2f normal_left(-tangent.y, tangent.x);
-    cv::Point2f normal_right(tangent.y, -tangent.x);
+    // 计算法向量（关键）
+    // 在 2D 中，把一个向量 (x, y) 逆时针旋转 90°，得到 (-y, x)，顺时针旋转 90°，得到 (y, -x)
+    cv::Point2f normal_left(-tangent.y, tangent.x);  // 逆时针90° → 左法向
+    cv::Point2f normal_right(tangent.y, -tangent.x); // 顺时针90° → 右法向
 
+    // 根据 follow_left_ 选择偏移方向，并生成偏移点
     cv::Point2f offset_dir = follow_left_ ? normal_right : normal_left;
-    // cv::Point2f offset_dir = follow_left_ ? normal_left : normal_right;
-    cv::Point2f offset_point = p + offset_dir * robot_radius;
+    cv::Point2f offset_point = p + offset_dir * offset_value;
     offset_path.push_back(offset_point);
   }
   return offset_path;
@@ -440,7 +453,7 @@ nav_msgs::Path EdgeFollower::generateLocalTrajectory(const sensor_msgs::LaserSca
 
   tf2::Transform robot_tf;
   tf2::fromMsg(robot_pose.pose, robot_tf);
-  for (const auto &p_local : final_points)
+  for (const auto &p_local : offset_points)
   {
     tf2::Vector3 v_local(p_local.x, p_local.y, 0);
     tf2::Vector3 v_global = robot_tf * v_local;
