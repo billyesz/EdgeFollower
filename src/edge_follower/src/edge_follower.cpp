@@ -9,6 +9,8 @@
 #include <tf2/LinearMath/Vector3.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.h>
 #include <visualization_msgs/MarkerArray.h>
+#include <queue>
+#include <algorithm>
 
 // ====== 新增：Eigen Spline 支持 ======
 #include <unsupported/Eigen/Splines>
@@ -139,6 +141,209 @@ std::vector<cv::Point2f> filterSidePoints(
     }
   }
   return (max_len >= 2) ? segments[best_idx] : std::vector<cv::Point2f>();
+}
+
+// 辅助函数：计算两点距离
+inline float dist2D(const cv::Point2f &a, const cv::Point2f &b)
+{
+  float dx = a.x - b.x;
+  float dy = a.y - b.y;
+  return std::sqrt(dx * dx + dy * dy);
+}
+
+// 辅助函数：计算两个点集之间的最小距离
+float minDistanceBetweenClusters(const std::vector<cv::Point2f> &A,
+                                 const std::vector<cv::Point2f> &B)
+{
+  float min_dist = std::numeric_limits<float>::max();
+  for (const auto &a : A)
+  {
+    for (const auto &b : B)
+    {
+      float d = dist2D(a, b);
+      if (d < min_dist)
+        min_dist = d;
+    }
+  }
+  return min_dist;
+}
+
+// DBSCAN 聚类（简化版，适合小规模点云）
+std::vector<std::vector<cv::Point2f>> dbscanClustering(
+    const std::vector<cv::Point2f> &points,
+    float eps,
+    int min_pts)
+{
+
+  int n = points.size();
+  std::vector<int> labels(n, -1); // -1: noise, >=0: cluster id
+  int cluster_id = 0;
+
+  for (int i = 0; i < n; ++i)
+  {
+    if (labels[i] != -1)
+      continue; // already processed
+
+    // Find neighbors
+    std::vector<int> neighbors;
+    for (int j = 0; j < n; ++j)
+    {
+      if (dist2D(points[i], points[j]) <= eps)
+      {
+        neighbors.push_back(j);
+      }
+    }
+
+    if (static_cast<int>(neighbors.size()) < min_pts)
+    {
+      labels[i] = -2; // mark as noise (optional)
+      continue;
+    }
+
+    // Start new cluster
+    labels[i] = cluster_id;
+    std::queue<int> seeds;
+    for (int idx : neighbors)
+    {
+      if (labels[idx] == -1 || labels[idx] == -2)
+      {
+        labels[idx] = cluster_id;
+        seeds.push(idx);
+      }
+    }
+
+    while (!seeds.empty())
+    {
+      int current = seeds.front();
+      seeds.pop();
+
+      std::vector<int> current_neighbors;
+      for (int j = 0; j < n; ++j)
+      {
+        if (dist2D(points[current], points[j]) <= eps)
+        {
+          current_neighbors.push_back(j);
+        }
+      }
+
+      if (static_cast<int>(current_neighbors.size()) >= min_pts)
+      {
+        for (int idx : current_neighbors)
+        {
+          if (labels[idx] == -1 || labels[idx] == -2)
+          {
+            labels[idx] = cluster_id;
+            seeds.push(idx);
+          }
+        }
+      }
+    }
+    cluster_id++;
+  }
+
+  // Build clusters
+  std::vector<std::vector<cv::Point2f>> clusters(cluster_id);
+  for (int i = 0; i < n; ++i)
+  {
+    if (labels[i] >= 0)
+    {
+      clusters[labels[i]].push_back(points[i]);
+    }
+  }
+
+  return clusters;
+}
+
+// 主函数：聚类 + 合并 + 选择主簇
+std::vector<cv::Point2f> clusterAndSelectMain(
+    const std::vector<cv::Point2f> &points,
+    bool follow_left,
+    float cluster_eps,
+    int min_cluster_size,
+    float merge_threshold)
+{
+
+  if (points.size() < static_cast<size_t>(min_cluster_size))
+  {
+    return points; // fallback
+  }
+
+  // Step 1: DBSCAN 聚类
+  auto clusters = dbscanClustering(points, cluster_eps, min_cluster_size);
+  if (clusters.empty())
+  {
+    return points;
+  }
+
+  // Step 2: 合并邻近簇
+  std::vector<std::vector<cv::Point2f>> merged_clusters;
+  for (auto cluster : clusters)
+  {
+    bool merged = false;
+    for (auto &mc : merged_clusters)
+    {
+      if (minDistanceBetweenClusters(cluster, mc) <= merge_threshold)
+      {
+        mc.insert(mc.end(), cluster.begin(), cluster.end());
+        merged = true;
+        break;
+      }
+    }
+    if (!merged)
+    {
+      merged_clusters.push_back(cluster);
+    }
+  }
+
+  // Step 3: 选择主簇
+  // 标准：1. 在目标侧；2. 离机器人最近（x 最小）；3. 点数最多
+  std::vector<cv::Point2f> best_cluster;
+  float best_score = -1.0f;
+
+  for (const auto &cluster : merged_clusters)
+  {
+    if (cluster.size() < static_cast<size_t>(min_cluster_size))
+      continue;
+
+    // 判断是否在目标侧（简单策略：多数点满足）
+    int target_side_count = 0;
+    for (const auto &p : cluster)
+    {
+      bool is_target = follow_left ? (p.y > 0) : (p.y < 0);
+      if (is_target)
+        target_side_count++;
+    }
+    float target_ratio = static_cast<float>(target_side_count) / cluster.size();
+
+    // 如果目标侧占比太低，跳过
+    if (target_ratio < 0.6f)
+      continue;
+
+    // 计算最近点的 x（假设机器人在原点，朝 +x 方向）
+    float min_x = std::numeric_limits<float>::max();
+    for (const auto &p : cluster)
+    {
+      if (p.x < min_x)
+        min_x = p.x;
+    }
+
+    // 打分：-min_x（越小越好） + 0.01 * size（辅助）
+    float score = -min_x + 0.01f * static_cast<float>(cluster.size());
+
+    if (score > best_score)
+    {
+      best_score = score;
+      best_cluster = cluster;
+    }
+  }
+
+  // 如果没找到合适的，返回原始点（fallback）
+  if (best_cluster.empty())
+  {
+    return points;
+  }
+
+  return best_cluster;
 }
 
 EdgeFollower::EdgeFollower(ros::NodeHandle &nh)
@@ -424,11 +629,14 @@ nav_msgs::Path EdgeFollower::generateLocalTrajectory(const sensor_msgs::LaserSca
   }
 
   // ===== 关键修改：使用 Spline 拟合代替 smoothPath + resamplePath =====
-  auto fitted_contour = fitSplineContour(filter_points, 40); // 40 个采样点
-  publishPointCloud(fitted_contour, "base_footprint", ros::Time::now(), fitted_contour_pub_);
+  // auto fitted_contour = fitSplineContour(filter_points, 40); // 40 个采样点
+  // publishPointCloud(fitted_contour, "base_footprint", ros::Time::now(), fitted_contour_pub_);
+
+  auto main_cluster = clusterAndSelectMain(filter_points, follow_left_, 0.3f, 3, 0.4f);
+  publishPointCloud(main_cluster, "base_footprint", ros::Time::now(), fitted_contour_pub_);
 
   float robot_radius = 0.25f; // 根据你的参数
-  auto offset_points = offsetPoints(fitted_contour, robot_radius);
+  auto offset_points = offsetPoints(main_cluster, robot_radius);
 
   // ===== 新增：曲率限制 =====
   const float max_curvature = 3.33f; // 对应 R_min = 0.3m
