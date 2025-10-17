@@ -174,7 +174,6 @@ std::vector<std::vector<cv::Point2f>> dbscanClustering(
     float eps,
     int min_pts)
 {
-
   int n = points.size();
   std::vector<int> labels(n, -1); // -1: noise, >=0: cluster id
   int cluster_id = 0;
@@ -251,7 +250,338 @@ std::vector<std::vector<cv::Point2f>> dbscanClustering(
     }
   }
 
+  ROS_INFO("DBSCAN found %zu clusters", clusters.size());
+
   return clusters;
+}
+
+// 线性插值：在相邻点间距超过 max_gap 时插入中间点
+std::vector<cv::Point2f> interpolatePoints(
+    const std::vector<cv::Point2f> &points,
+    float max_gap = 0.1f) // 单位：米，例如 0.1m = 10cm
+{
+  if (points.size() <= 1)
+  {
+    return points;
+  }
+
+  std::vector<cv::Point2f> result;
+  result.reserve(points.size() * 3); // 预留空间，避免频繁 realloc
+
+  result.push_back(points[0]);
+
+  for (size_t i = 1; i < points.size(); ++i)
+  {
+    const cv::Point2f &prev = result.back(); // 上一个已插入的点（可能是原点或插值点）
+    const cv::Point2f &curr = points[i];
+
+    float dx = curr.x - prev.x;
+    float dy = curr.y - prev.y;
+    float dist = std::sqrt(dx * dx + dy * dy);
+
+    // 如果两点距离超过 max_gap，进行插值
+    if (dist > max_gap && dist > 1e-6f)
+    {
+      int num_segments = static_cast<int>(std::ceil(dist / max_gap));
+      float step = 1.0f / num_segments;
+
+      for (int s = 1; s < num_segments; ++s)
+      {
+        float t = s * step;
+        cv::Point2f interp(
+            prev.x + t * dx,
+            prev.y + t * dy);
+        result.push_back(interp);
+      }
+    }
+
+    // 添加当前原始点
+    result.push_back(curr);
+  }
+
+  return result;
+}
+
+std::vector<cv::Point2f> clusterAndMergeNearby(
+    const std::vector<cv::Point2f> &points,
+    float eps = 0.25f,           // DBSCAN 内部距离阈值
+    int min_pts = 3,             // 最小点数
+    float merge_threshold = 0.3f // 簇间合并距离
+)
+{
+  if (points.size() < min_pts)
+    return {};
+
+  // Step 1: DBSCAN 聚类
+  auto clusters = dbscanClustering(points, eps, min_pts);
+  if (clusters.empty())
+    return points;
+
+  // Step 2: 合并邻近簇
+  std::vector<std::vector<cv::Point2f>> merged_clusters;
+  for (auto &c : clusters)
+  {
+    bool merged = false;
+    for (auto &mc : merged_clusters)
+    {
+      if (minDistanceBetweenClusters(c, mc) <= merge_threshold)
+      {
+        mc.insert(mc.end(), c.begin(), c.end());
+        merged = true;
+        break;
+      }
+    }
+    if (!merged)
+    {
+      merged_clusters.push_back(c);
+    }
+  }
+
+  // Step 3: 选择主簇（目标侧 + 最近）
+  std::vector<cv::Point2f> best_cluster;
+  float best_score = -1.0f;
+
+  for (const auto &cluster : merged_clusters)
+  {
+    if (cluster.size() < min_pts)
+      continue;
+
+    // 判断目标侧（假设 follow_left_ == true → y > 0）
+    int target_side_count = 0;
+    for (const auto &p : cluster)
+    {
+      if (p.y > 0)
+        target_side_count++;
+    }
+    float target_ratio = static_cast<float>(target_side_count) / cluster.size();
+    if (target_ratio < 0.6f)
+      continue;
+
+    // 找最小 x
+    auto min_it = std::min_element(cluster.begin(), cluster.end(),
+                                   [](const cv::Point2f &a, const cv::Point2f &b)
+                                   {
+                                     return a.x < b.x;
+                                   });
+    float min_x = min_it->x;
+
+    float score = -min_x + 0.01f * static_cast<float>(cluster.size());
+    if (score > best_score)
+    {
+      best_score = score;
+      best_cluster = cluster;
+    }
+  }
+
+  return best_cluster;
+}
+
+std::vector<cv::Point2f> clusterByLocalDensity(
+    const std::vector<cv::Point2f> &points,
+    float window_size = 0.5f, // 滑动窗口宽度
+    float min_density = 0.1f  // 每米至少 0.1 个点
+)
+{
+  if (points.empty())
+    return {};
+
+  // Step 1: 按 x 排序
+  std::vector<cv::Point2f> sorted = points;
+  std::sort(sorted.begin(), sorted.end(), [](const cv::Point2f &a, const cv::Point2f &b)
+            { return a.x < b.x; });
+
+  std::vector<std::vector<cv::Point2f>> clusters;
+  int n = sorted.size();
+
+  for (int i = 0; i < n; ++i)
+  {
+    // 找到以 sorted[i] 为中心、x ∈ [x_i - window_size/2, x_i + window_size/2] 的所有点
+    std::vector<cv::Point2f> window_points;
+    for (int j = 0; j < n; ++j)
+    {
+      if (std::abs(sorted[j].x - sorted[i].x) <= window_size / 2)
+      {
+        window_points.push_back(sorted[j]);
+      }
+    }
+
+    // 如果窗口内点数 ≥ 3，且密度达标，则视为一个簇
+    float length = window_size;
+    float density = static_cast<float>(window_points.size()) / length;
+    if (window_points.size() >= 3 && density >= min_density)
+    {
+      // 合并所有点（避免重复）
+      std::vector<cv::Point2f> unique_cluster;
+      for (auto &p : window_points)
+      {
+        bool exists = false;
+        for (auto &uc : unique_cluster)
+        {
+          if (dist2D(p, uc) < 0.05f)
+          { // 去重
+            exists = true;
+            break;
+          }
+        }
+        if (!exists)
+          unique_cluster.push_back(p);
+      }
+
+      // 添加到集群列表
+      bool already_added = false;
+      for (auto &c : clusters)
+      {
+        if (c.size() > 0)
+        {
+          float dist_to_c = dist2D(unique_cluster[0], c[0]);
+          if (dist_to_c < 0.1f)
+          {
+            c.insert(c.end(), unique_cluster.begin(), unique_cluster.end());
+            already_added = true;
+            break;
+          }
+        }
+      }
+      if (!already_added)
+      {
+        clusters.push_back(unique_cluster);
+      }
+    }
+  }
+
+  // Step 2: 选择主簇（目标侧 + 最近）
+  std::vector<cv::Point2f> best_cluster;
+  float best_score = -1.0f;
+
+  for (const auto &cluster : clusters)
+  {
+    if (cluster.size() < 3)
+      continue;
+
+    // 判断目标侧（假设 follow_left_ == true → y > 0）
+    int target_side_count = 0;
+    for (const auto &p : cluster)
+    {
+      if (p.y > 0)
+        target_side_count++;
+    }
+    float target_ratio = static_cast<float>(target_side_count) / cluster.size();
+    if (target_ratio < 0.6f)
+      continue;
+
+    // 找最小 x
+    auto min_it = std::min_element(cluster.begin(), cluster.end(),
+                                   [](const cv::Point2f &a, const cv::Point2f &b)
+                                   {
+                                     return a.x < b.x;
+                                   });
+    float min_x = min_it->x;
+
+    float score = -min_x + 0.01f * static_cast<float>(cluster.size());
+    if (score > best_score)
+    {
+      best_score = score;
+      best_cluster = cluster;
+    }
+  }
+
+  return best_cluster;
+}
+
+std::vector<cv::Point2f> mergeNearbyClustersByDensity(
+    const std::vector<cv::Point2f> &points,
+    float max_distance = 0.3f,
+    float min_density = 0.1f)
+{
+  if (points.empty())
+    return {};
+
+  // Step 1: 按 x 排序（假设机器人朝 +x）
+  std::vector<cv::Point2f> sorted = points;
+  std::sort(sorted.begin(), sorted.end(), [](const cv::Point2f &a, const cv::Point2f &b)
+            { return a.x < b.x; });
+
+  // Step 2: 合并邻近点
+  std::vector<std::vector<cv::Point2f>> clusters;
+  std::vector<cv::Point2f> current;
+
+  for (const auto &p : sorted)
+  {
+    if (current.empty())
+    {
+      current.push_back(p);
+    }
+    else
+    {
+      float dx = p.x - current.back().x;
+      float dy = p.y - current.back().y;
+      float dist = std::sqrt(dx * dx + dy * dy);
+
+      if (dist <= max_distance)
+      {
+        current.push_back(p);
+      }
+      else
+      {
+        // 密度过滤：长度 > 0.1m 且密度达标
+        float length = current.back().x - current.front().x;
+        if (length > 0.1f && static_cast<float>(current.size()) / length >= min_density)
+        {
+          clusters.push_back(current);
+        }
+        current.clear();
+        current.push_back(p);
+      }
+    }
+  }
+
+  // 添加最后一个簇
+  if (!current.empty())
+  {
+    float length = current.back().x - current.front().x;
+    if (length > 0.1f && static_cast<float>(current.size()) / length >= min_density)
+    {
+      clusters.push_back(current);
+    }
+  }
+
+  // Step 3: 选择主簇（目标侧 + 最近）
+  std::vector<cv::Point2f> best_cluster;
+  float best_score = -1.0f;
+
+  for (const auto &cluster : clusters)
+  {
+    if (cluster.size() < 3)
+      continue;
+
+    // 判断目标侧（假设 follow_left_ == true → y > 0）
+    int target_side_count = 0;
+    for (const auto &p : cluster)
+    {
+      if (p.y > 0)
+        target_side_count++; // ← 请根据你的 follow_left_ 逻辑调整
+    }
+    float target_ratio = static_cast<float>(target_side_count) / cluster.size();
+    if (target_ratio < 0.6f)
+      continue;
+
+    // 找最小 x（最近点）
+    auto min_it = std::min_element(cluster.begin(), cluster.end(),
+                                   [](const cv::Point2f &a, const cv::Point2f &b)
+                                   {
+                                     return a.x < b.x;
+                                   });
+    float min_x = min_it->x;
+
+    float score = -min_x + 0.01f * static_cast<float>(cluster.size());
+    if (score > best_score)
+    {
+      best_score = score;
+      best_cluster = cluster;
+    }
+  }
+
+  return best_cluster;
 }
 
 // 主函数：聚类 + 合并 + 选择主簇
@@ -392,21 +722,18 @@ std::vector<cv::Point2f> EdgeFollower::extractContourPoints(const sensor_msgs::L
   constexpr float ANGLE_HALF = 65.0f * M_PI / 180.0f;
   std::vector<std::pair<float, cv::Point2f>> angle_point_pairs;
 
-  // ROS_INFO("scan.ranges.size : %zu", scan.ranges.size());
   for (size_t i = 0; i < scan.ranges.size(); ++i)
   {
     float range = scan.ranges[i];
     if (std::isnan(range) || std::isinf(range))
       continue;
     float angle = scan.angle_min + i * scan.angle_increment;
-    float angle_deg = angle * 180.0f / M_PI;
     if (std::abs(angle) > ANGLE_HALF) // FOV: -65° ~ +65°
       continue;
     if (range < MIN_DIST || range > MAX_DIST)
       continue;
     float x = range * std::cos(angle);
     float y = range * std::sin(angle);
-    // ROS_INFO("[%zu] (%f, %f) @ angle %f  angle_deg %f  scan.angle_min %f  scan.angle_increment %f", i, x, y, angle, angle_deg, scan.angle_min, scan.angle_increment);
     angle_point_pairs.emplace_back(angle, cv::Point2f(x, y));
   }
 
@@ -420,9 +747,19 @@ std::vector<cv::Point2f> EdgeFollower::extractContourPoints(const sensor_msgs::L
 
   std::vector<cv::Point2f> points;
   points.reserve(angle_point_pairs.size());
+
+  // 过滤点，使每个点至少保持 0.05m 的间距
+  constexpr float min_distance = 0.05f;
+  cv::Point2f last_accepted_point(1e9, 1e9); // 初始化为一个很大的值，确保第一个点总是被接受
+
   for (const auto &ap : angle_point_pairs)
   {
-    points.push_back(ap.second);
+    // points.push_back(ap.second);
+    if (cv::norm(ap.second - last_accepted_point) >= min_distance)
+    {
+      points.push_back(ap.second);
+      last_accepted_point = ap.second;
+    }
   }
 
   // points 永远是从右→左（y 递增），针对不同的场景，后续对点的顺序需要调整，否则路径方向会出错
@@ -632,11 +969,25 @@ nav_msgs::Path EdgeFollower::generateLocalTrajectory(const sensor_msgs::LaserSca
   // auto fitted_contour = fitSplineContour(filter_points, 40); // 40 个采样点
   // publishPointCloud(fitted_contour, "base_footprint", ros::Time::now(), fitted_contour_pub_);
 
-  auto main_cluster = clusterAndSelectMain(filter_points, follow_left_, 0.3f, 3, 0.4f);
-  publishPointCloud(main_cluster, "base_footprint", ros::Time::now(), fitted_contour_pub_);
+  // auto main_cluster = mergeNearbyClustersByDensity(filter_points, 0.25f, 0.1f);
+  // auto main_cluster = clusterAndSelectMain(filter_points, follow_left_, 0.4f, 3, 0.1f);
+  // auto main_cluster = clusterByLocalDensity(filter_points, 0.5f, 0.1f);
+  auto main_cluster = clusterAndMergeNearby(filter_points, 0.25f, 3, 0.3f);
+
+  // 1. 排序：按 x 从大到小（近 → 远）
+  std::vector<cv::Point2f> sorted_cluster = main_cluster;
+  std::sort(sorted_cluster.begin(), sorted_cluster.end(),
+            [](const cv::Point2f &a, const cv::Point2f &b)
+            {
+              return a.x > b.x; // 机器人前方 x 更大
+            });
+
+  // 2. 插值：填补大于 0.1m 的空隙
+  // auto dense_cluster = interpolatePoints(sorted_cluster, 0.03f); // 每 10cm 至少一个点
+  publishPointCloud(sorted_cluster, "base_footprint", ros::Time::now(), fitted_contour_pub_);
 
   float robot_radius = 0.25f; // 根据你的参数
-  auto offset_points = offsetPoints(main_cluster, robot_radius);
+  auto offset_points = offsetPoints(sorted_cluster, robot_radius);
 
   // ===== 新增：曲率限制 =====
   const float max_curvature = 3.33f; // 对应 R_min = 0.3m
@@ -661,7 +1012,7 @@ nav_msgs::Path EdgeFollower::generateLocalTrajectory(const sensor_msgs::LaserSca
 
   tf2::Transform robot_tf;
   tf2::fromMsg(robot_pose.pose, robot_tf);
-  for (const auto &p_local : offset_points)
+  for (const auto &p_local : final_points)
   {
     tf2::Vector3 v_local(p_local.x, p_local.y, 0);
     tf2::Vector3 v_global = robot_tf * v_local;
